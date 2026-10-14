@@ -33,6 +33,10 @@ ARG THEME_VARIANT=lite
 COPY synthetic-nature/package.json synthetic-nature/package-lock.json ./
 RUN npm ci
 
+# The vite build reads the release version from the repo-root package.json
+# (vite.config's __ENZO_VERSION__ define feeds the update banner).
+COPY package.json /build/package.json
+
 COPY synthetic-nature/ ./
 # The lite image keeps exactly one theme video — the 3.3MB AI-animated NYC
 # subway loop — by name (a size cutoff keeps every small file, and the
