@@ -1,16 +1,20 @@
 /**
  * PreviewPanel.tsx — the live code-preview side panel.
  *
- * Black paper: near-black base, wrinkle + grain textures, slow drifting
- * smears, deep shadows, one-shot sheen on open. Portaled to <body> so it
- * escapes ancestor transforms/overflow and always renders ABOVE the app header
- * + terminal chrome (viewport-level stacking). The dock/reflow math lives in
- * TerminalSection (it owns the grid this panel docks beside); this component
- * owns the look and the choreography.
+ * Quiet developer-tool chrome around the generated app (2026-10 redesign per
+ * the security/UX audit): a flat panel surface, a thin border, a browser-style
+ * URL field and icon actions. The old paper-texture treatment — wrinkle +
+ * grain filters, drifting smears, vignette, sheen sweep — competed with the
+ * very application the user is trying to inspect, so the preview body now gets
+ * the space and contrast while ENZO's texture work stays in the surrounding
+ * workspace. Portaled to <body> so it escapes ancestor transforms/overflow and
+ * always renders ABOVE the app header + terminal chrome. The dock/reflow math
+ * lives in TerminalSection (it owns the grid this panel docks beside).
  */
 
+import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { motion, AnimatePresence, type Variants } from 'framer-motion'
+import { motion, AnimatePresence, useReducedMotion, type Variants } from 'framer-motion'
 import { Monitor, Download, ExternalLink, Copy, Check, RefreshCw, X } from 'lucide-react'
 
 export interface PreviewData {
@@ -39,32 +43,14 @@ interface PreviewPanelProps {
   onReopen: () => void
 }
 
-const panelVariants: Variants = {
-  hidden: { opacity: 0, x: 64, scale: 0.955, filter: 'blur(8px)' },
-  show: {
-    opacity: 1,
-    x: 0,
-    scale: 1,
-    filter: 'blur(0px)',
-    transition: { duration: 0.5, ease: [0.16, 1, 0.3, 1], staggerChildren: 0.07, delayChildren: 0.1 },
-  },
-  dimmed: { opacity: 0, x: 56, scale: 0.97, transition: { duration: 0.25, ease: 'easeIn' } },
-  exit: { opacity: 0, x: 48, scale: 0.975, filter: 'blur(4px)', transition: { duration: 0.28, ease: 'easeIn' } },
-}
-
-const sectionVariants: Variants = {
-  hidden: { opacity: 0, y: 14 },
-  show: { opacity: 1, y: 0, transition: { duration: 0.4, ease: [0.16, 1, 0.3, 1] } },
-  dimmed: { opacity: 0, transition: { duration: 0.15 } },
-  exit: { opacity: 0, y: 8, transition: { duration: 0.2, ease: 'easeIn' } },
-}
+const actionButton =
+  'flex h-7 w-7 items-center justify-center rounded-md border border-white/10 text-white/55 transition-colors hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-white/10 disabled:hover:text-white/55'
 
 export default function PreviewPanel({
   preview,
   open,
   sideDrawerOpen,
   maximized,
-  lowPower,
   copied,
   frameKey,
   storedTask,
@@ -76,29 +62,33 @@ export default function PreviewPanel({
   onClose,
   onReopen,
 }: PreviewPanelProps) {
+  const prefersReducedMotion = useReducedMotion()
+  // Clicking a file in the strip loads that path inside the frame (inspection
+  // without leaving the panel); reload clears it back to the entry page.
+  const [srcOverride, setSrcOverride] = useState<string | null>(null)
+
+  useEffect(() => {
+    setSrcOverride(null)
+  }, [preview?.id])
+
   if (!preview) return null
+
+  const panelVariants: Variants = prefersReducedMotion
+    ? {
+        hidden: { opacity: 0 },
+        show: { opacity: 1, transition: { duration: 0.15 } },
+        dimmed: { opacity: 0, transition: { duration: 0.1 } },
+        exit: { opacity: 0, transition: { duration: 0.15 } },
+      }
+    : {
+        hidden: { opacity: 0, x: 40 },
+        show: { opacity: 1, x: 0, transition: { duration: 0.28, ease: [0.16, 1, 0.3, 1] } },
+        dimmed: { opacity: 0, x: 24, transition: { duration: 0.15, ease: 'easeIn' } },
+        exit: { opacity: 0, x: 28, transition: { duration: 0.2, ease: 'easeIn' } },
+      }
 
   return createPortal(
     <>
-      {/* Paper texture filter defs — rendered as an inline <svg><rect>
-          (not a CSS filter url()) so every engine, Safari included,
-          rasterizes them. Lives inside the portal so the id is always in
-          the same document as the panel. */}
-      <svg width="0" height="0" aria-hidden="true" className="absolute">
-        <defs>
-          <filter id="enzo-paper-wrinkle" x="-5%" y="-5%" width="110%" height="110%">
-            <feTurbulence type="fractalNoise" baseFrequency="0.011 0.016" numOctaves="4" seed="11" result="bumps" />
-            <feDiffuseLighting in="bumps" lightingColor="#ffffff" surfaceScale="2.2" diffuseConstant="1.05">
-              <feDistantLight azimuth="235" elevation="58" />
-            </feDiffuseLighting>
-          </filter>
-          <filter id="enzo-paper-grain">
-            <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="4" />
-            <feColorMatrix type="saturate" values="0" />
-          </filter>
-        </defs>
-      </svg>
-
       {/* Floating reopen tab — shown when a preview exists but the panel is
           closed so the user can summon it back without re-asking the model.
           The vertical centering lives inside framer's transform (y: '-50%')
@@ -107,23 +97,27 @@ export default function PreviewPanel({
         {!open && preview && (
           <motion.button
             type="button"
-            initial={{ opacity: 0, x: 44, y: '-50%', scale: 0.9 }}
-            animate={{ opacity: sideDrawerOpen ? 0 : 1, x: 0, y: '-50%', scale: 1 }}
-            exit={{ opacity: 0, x: 44, scale: 0.9, transition: { duration: 0.2, ease: 'easeIn' } }}
-            transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
-            whileTap={{ scale: 0.94 }}
+            initial={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, x: 44, y: '-50%' }}
+            animate={
+              prefersReducedMotion
+                ? { opacity: sideDrawerOpen ? 0 : 1 }
+                : { opacity: sideDrawerOpen ? 0 : 1, x: 0, y: '-50%' }
+            }
+            exit={{ opacity: 0, transition: { duration: 0.15, ease: 'easeIn' } }}
+            transition={{ duration: prefersReducedMotion ? 0.15 : 0.3, ease: 'easeOut' }}
             onClick={onReopen}
-            className={`fixed top-1/2 right-0 z-[9997] flex items-center gap-2 rounded-l-xl border border-r-0 border-white/[0.10] bg-[#0a0a0c]/95 backdrop-blur-md px-3 py-2.5 text-white/70 hover:text-white hover:border-white/25 shadow-[0_10px_36px_rgba(0,0,0,0.65),inset_0_1px_0_rgba(255,255,255,0.07)] cursor-pointer ${sideDrawerOpen ? 'pointer-events-none' : ''}`}
+            className={`fixed top-1/2 right-0 z-[9997] flex items-center gap-2 rounded-l-xl border border-r-0 border-white/10 bg-[#0c0c0e]/95 px-3 py-2 text-white/70 hover:text-white hover:border-white/25 shadow-lg cursor-pointer ${sideDrawerOpen ? 'pointer-events-none' : ''}`}
           >
             <Monitor size={14} className="text-white/70" />
-            <span className="text-[10px] font-mono uppercase tracking-widest">Preview</span>
+            <span className="text-xs font-medium">Preview</span>
           </motion.button>
         )}
       </AnimatePresence>
 
       {/* The `dimmed` variant replaces a Tailwind opacity-0 toggle — an inline
           framer opacity always beat that class, so the panel never actually
-          faded when a drawer opened. */}
+          faded when a drawer opened. On narrow screens the panel becomes a
+          full-width sheet instead of forcing the 46vw dock to overflow. */}
       <AnimatePresence>
         {open && (
           <motion.div
@@ -132,149 +126,108 @@ export default function PreviewPanel({
             exit="exit"
             variants={panelVariants}
             style={{ pointerEvents: sideDrawerOpen ? 'none' : 'auto' }}
-            whileTap={{ scale: 0.997 }}
-            className={`fixed ${maximized ? 'top-2' : 'top-20'} bottom-2 right-2 z-[9998] w-[min(46vw,640px)] min-w-[360px] flex flex-col overflow-hidden rounded-xl transition-[top] duration-300 will-change-transform ring-1 ring-white/[0.07] shadow-[0_30px_90px_-12px_rgba(0,0,0,0.9),0_12px_36px_rgba(0,0,0,0.7),inset_0_1px_0_rgba(255,255,255,0.09),inset_0_-1px_0_rgba(0,0,0,0.65)]`}
+            className={`fixed ${maximized ? 'top-2' : 'top-20'} bottom-2 right-2 z-[9998] w-[min(46vw,640px)] max-[720px]:w-[calc(100vw-1rem)] max-[720px]:min-w-0 min-w-[360px] flex flex-col overflow-hidden rounded-xl bg-[#0c0c0e] ring-1 ring-white/10 shadow-[0_16px_48px_rgba(0,0,0,0.55)] transition-[top] duration-300 will-change-transform`}
           >
-            {/* Paper base + textures + smears — z-0, under the content */}
-            <div
-              aria-hidden
-              className="absolute inset-0 z-0 bg-[radial-gradient(130%_110%_at_18%_0%,#1a1a1c_0%,#0c0c0d_48%,#060607_100%)]"
-            />
-            <svg aria-hidden className="absolute inset-0 z-0 h-full w-full opacity-[0.16] mix-blend-screen">
-              <rect width="100%" height="100%" filter="url(#enzo-paper-wrinkle)" />
-            </svg>
-            <svg aria-hidden className="absolute inset-0 z-0 h-full w-full opacity-[0.05] mix-blend-screen">
-              <rect width="100%" height="100%" filter="url(#enzo-paper-grain)" />
-            </svg>
-            {!lowPower && (
-              <>
-                <motion.div
-                  aria-hidden
-                  className="absolute -left-20 top-10 z-0 h-64 w-64 rounded-full blur-2xl"
-                  style={{ background: 'radial-gradient(closest-side, rgba(255,255,255,0.055), transparent)' }}
-                  animate={{ x: [0, 28, -10, 0], y: [0, -16, 12, 0] }}
-                  transition={{ duration: 27, repeat: Infinity, ease: 'easeInOut' }}
-                />
-                <motion.div
-                  aria-hidden
-                  className="absolute right-10 bottom-24 z-0 h-80 w-80 rounded-full blur-2xl"
-                  style={{ background: 'radial-gradient(closest-side, rgba(255,255,255,0.045), transparent)' }}
-                  animate={{ x: [0, -34, 14, 0], y: [0, 18, -12, 0] }}
-                  transition={{ duration: 33, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
-                />
-                <motion.div
-                  aria-hidden
-                  className="absolute left-1/3 top-1/2 z-0 h-52 w-72 rounded-full blur-2xl"
-                  style={{ background: 'radial-gradient(closest-side, rgba(255,255,255,0.04), transparent)' }}
-                  animate={{ x: [0, 22, 18, 0], y: [0, 12, -14, 0] }}
-                  transition={{ duration: 24, repeat: Infinity, ease: 'easeInOut', delay: 9 }}
-                />
-              </>
-            )}
-
-            {/* Panel header — mild glass strip over the paper */}
-            <motion.div
-              variants={sectionVariants}
-              className="relative z-10 flex items-center justify-between gap-2 border-b border-white/[0.07] px-3.5 py-2.5 bg-white/[0.04] backdrop-blur-md"
-            >
-              <div className="flex items-center gap-2 min-w-0">
-                <Monitor size={13} className="text-white/70 shrink-0" />
-                <span className="text-[10px] font-mono uppercase tracking-widest text-white/60 truncate">
-                  {preview.title || 'Live Preview'}
+            {/* Panel header — browser-style toolbar: URL field + icon actions */}
+            <div className="relative z-10 flex items-center gap-2 border-b border-white/[0.06] px-2.5 py-2">
+              <Monitor size={14} className="ml-1 shrink-0 text-white/45" aria-hidden />
+              <input
+                type="text"
+                readOnly
+                value={preview.url}
+                title={preview.title || 'Live Preview'}
+                aria-label="Preview URL"
+                className="h-7 min-w-0 flex-1 rounded-md border border-white/10 bg-white/[0.04] px-2 font-mono text-xs text-white/60 selection:bg-white/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+              />
+              {preview.isProject && (
+                <span className="shrink-0 text-[11px] text-white/45" title={`${preview.files?.length ?? 0} files in this project`}>
+                  {preview.files?.length ?? 0} files
                 </span>
-                {preview.isProject && (
-                  <span className="shrink-0 rounded-full bg-white/[0.06] border border-white/[0.08] px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-widest text-white/70">
-                    {preview.files?.length ?? 0} files
-                  </span>
-                )}
-                {storedFileCount > 0 && (
-                  <span className="shrink-0 rounded-full bg-white/[0.06] border border-white/[0.08] px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-widest text-white/70">
-                    saved {storedFileCount}
-                  </span>
-                )}
-                <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-white/[0.06] border border-white/[0.08] px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-widest text-white/70">
-                  <motion.span
-                    aria-hidden
-                    className="h-1 w-1 rounded-full bg-white/80"
-                    animate={{ opacity: [1, 0.25, 1] }}
-                    transition={{ duration: 1.8, repeat: Infinity, ease: 'easeInOut' }}
-                  />
-                  running
+              )}
+              {storedFileCount > 0 && (
+                <span className="shrink-0 text-[11px] text-white/45" title="Files stored locally in this browser">
+                  saved {storedFileCount}
                 </span>
-              </div>
-              <div className="flex items-center gap-1 shrink-0">
+              )}
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={onCopyUrl}
+                  title="Copy preview URL"
+                  aria-label="Copy preview URL"
+                  className={actionButton}
+                >
+                  {copied ? <Check size={13} className="text-white/85" /> : <Copy size={13} />}
+                </button>
                 <button
                   type="button"
                   onClick={onZip}
                   disabled={!storedTask}
-                  title="Download these files as a .zip"
-                  className={`flex items-center gap-1.5 rounded-xl border px-2 py-1.5 text-[10px] font-mono uppercase tracking-widest transition-all cursor-pointer ${
-                    storedTask
-                      ? 'border-white/[0.10] text-white/70 hover:text-white hover:border-white/25 hover:bg-white/[0.06]'
-                      : 'border-white/[0.06] text-white/30 cursor-not-allowed'
-                  }`}
+                  title={storedTask ? 'Download these files as a .zip' : 'No stored snapshot to zip yet'}
+                  aria-label="Download as zip"
+                  className={actionButton}
                 >
-                  <Download size={10} />
-                  ZIP
+                  <Download size={13} />
                 </button>
                 <a
                   href={absoluteUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   title="Open in a new tab"
-                  className="flex items-center gap-1.5 rounded-xl border border-white/[0.10] px-2 py-1.5 text-[10px] font-mono uppercase tracking-widest text-white/70 hover:text-white hover:border-white/25 hover:bg-white/[0.06] transition-all cursor-pointer"
+                  aria-label="Open in a new tab"
+                  className={actionButton}
                 >
-                  <ExternalLink size={10} />
-                  Open new tab
+                  <ExternalLink size={13} />
                 </a>
                 <button
                   type="button"
-                  onClick={onCopyUrl}
-                  title="Copy preview URL"
-                  className="flex items-center gap-1 rounded-xl border border-white/[0.08] px-2 py-1.5 text-[10px] font-mono uppercase tracking-widest text-white/50 hover:text-white hover:border-white/25 transition-all cursor-pointer"
-                >
-                  {copied ? <Check size={10} className="text-white/85" /> : <Copy size={10} />}
-                  {copied ? 'Copied' : 'URL'}
-                </button>
-                <button
-                  type="button"
-                  onClick={onReload}
+                  onClick={() => {
+                    setSrcOverride(null)
+                    onReload()
+                  }}
                   title="Reload preview"
-                  className="w-7 h-7 flex items-center justify-center rounded-xl border border-white/[0.08] text-white/50 hover:text-white hover:border-white/25 transition-all cursor-pointer"
+                  aria-label="Reload preview"
+                  className={actionButton}
                 >
-                  <RefreshCw size={11} />
+                  <RefreshCw size={13} />
                 </button>
                 <button
                   type="button"
                   onClick={onClose}
                   title="Close preview"
-                  className="w-7 h-7 flex items-center justify-center rounded-xl border border-white/[0.08] text-white/50 hover:text-white hover:border-white/25 hover:bg-white/[0.06] transition-all cursor-pointer"
+                  aria-label="Close preview"
+                  className={actionButton}
                 >
-                  <X size={12} />
+                  <X size={14} />
                 </button>
               </div>
-            </motion.div>
+            </div>
 
-            {/* File tree strip (multi-file projects) */}
+            {/* File strip (multi-file projects) — plain clickable paths; a
+                click loads that file inside the frame, reload returns to the
+                entry page. No decorative pills. */}
             {preview.isProject && preview.files && preview.files.length > 0 && (
-              <motion.div
-                variants={sectionVariants}
-                className="relative z-10 flex items-center gap-1.5 overflow-x-auto scrollbar-none border-b border-white/[0.07] px-3 py-1.5 bg-white/[0.03] backdrop-blur-sm"
-              >
+              <div className="relative z-10 flex items-center gap-0.5 overflow-x-auto scrollbar-none border-b border-white/[0.06] px-2.5 py-1">
                 {preview.files.map((f) => (
-                  <span
+                  <button
                     key={f.path}
-                    className="shrink-0 rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-white/55"
-                    title={f.path}
+                    type="button"
+                    onClick={() => setSrcOverride(`/api/project/${preview.id}/${f.path}`)}
+                    title={`Open ${f.path} in the preview frame`}
+                    className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 cursor-pointer ${
+                      srcOverride === `/api/project/${preview.id}/${f.path}`
+                        ? 'bg-white/[0.08] text-white/85'
+                        : 'text-white/45 hover:text-white/85 hover:bg-white/[0.05]'
+                    }`}
                   >
                     {f.path}
-                  </span>
+                  </button>
                 ))}
-              </motion.div>
+              </div>
             )}
 
-            {/* Preview body — clean white print mounted on the paper */}
-            <motion.div variants={sectionVariants} className="relative z-10 flex-1 min-h-0 p-1.5">
+            {/* Preview body — the generated app IS the panel content */}
+            <div className="relative z-10 flex-1 min-h-0 p-1.5">
               {/* NOTE: do not add allow-same-origin here. The code in this
                   frame is written by an LLM and served from our own origin,
                   so allow-scripts + allow-same-origin together let it reach
@@ -286,38 +239,16 @@ export default function PreviewPanel({
                   and pointer lock all still work. The backend mirrors this
                   via a `Content-Security-Policy: sandbox` header on
                   /api/preview, so the open-in-new-tab path is isolated too. */}
-              <div className="h-full w-full overflow-hidden rounded-lg bg-white shadow-[inset_0_0_0_1px_rgba(0,0,0,0.08),0_1px_0_rgba(255,255,255,0.04)]">
+              <div className="h-full w-full overflow-hidden rounded-lg bg-white shadow-[inset_0_0_0_1px_rgba(0,0,0,0.08)]">
                 <iframe
                   key={frameKey}
                   title="ENZO live preview"
-                  src={preview.url}
+                  src={srcOverride ?? preview.url}
                   sandbox="allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock"
                   className="h-full w-full border-0"
                 />
               </div>
-            </motion.div>
-
-            {/* Paper edge vignette — above the body but faint enough to
-                keep the preview content clean */}
-            <div
-              aria-hidden
-              className="pointer-events-none absolute inset-0 z-20 rounded-xl shadow-[inset_0_0_34px_rgba(0,0,0,0.38)]"
-            />
-
-            {/* One-shot sheen sweep on open — screen blend, so it only
-                reads on the dark paper and never washes the preview */}
-            <motion.div
-              aria-hidden
-              initial={{ x: '-170%', skewX: -16 }}
-              animate={{ x: '340%' }}
-              transition={{ duration: 1.15, delay: 0.55, ease: [0.3, 0, 0.2, 1] }}
-              className="pointer-events-none absolute inset-y-0 z-30 w-1/3"
-              style={{
-                background:
-                  'linear-gradient(90deg, transparent, rgba(255,255,255,0.09) 42%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.09) 58%, transparent)',
-                mixBlendMode: 'screen',
-              }}
-            />
+            </div>
           </motion.div>
         )}
       </AnimatePresence>

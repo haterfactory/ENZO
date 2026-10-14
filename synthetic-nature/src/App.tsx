@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react'
 import TerminalSection from './components/TerminalSection'
+import UpdateBanner from './components/UpdateBanner'
 import AgentsSection from './components/AgentsSection'
 import { DrawLineText } from './components/ui/draw-line-text'
 import { TactileButton } from './components/ui/tactile-button'
@@ -1933,6 +1934,7 @@ function App() {
             )}
 
             {activeTab === 'agents' && <AgentsSection />}
+            <UpdateBanner />
           </div>
         )}
 

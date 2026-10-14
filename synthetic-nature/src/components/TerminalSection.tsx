@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import * as keyVault from '../lib/keyVault'
+import { getEnzoOwnerId } from '../lib/enzoOwner'
 import SystemPulse from './SystemPulse'
 import gsap from 'gsap'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -38,6 +39,7 @@ import {
   Copy,
   FileSpreadsheet,
   Check,
+  Star,
 } from 'lucide-react'
 import { useVoiceInput } from '../hooks/useVoiceInput'
 import { useLowPowerMode } from '../hooks/useLowPowerMode'
@@ -1063,6 +1065,28 @@ export default function TerminalSection({
   // / done + file count — the live "is it coded?" signal under the reply.
   const [buildInfo, setBuildInfo] = useState<{ status: string; ok: boolean; fileCount: number; round: number; maxRounds: number } | null>(null)
   const buildInfoRef = useRef<typeof buildInfo>(null)
+  // One-time star ask: the moment a build verify passes (a real success), show
+  // a single slim strip above the composer. Capped at once per session and
+  // once EVER once clicked/dismissed — an ask that nags is worse than no ask.
+  const [starAskVisible, setStarAskVisible] = useState(false)
+  const maybeShowStarAsk = useCallback(() => {
+    try {
+      if (localStorage.getItem('enzo.star-ask.done')) return
+      if (sessionStorage.getItem('enzo.star-ask.shown') === '1') return
+      sessionStorage.setItem('enzo.star-ask.shown', '1')
+      setStarAskVisible(true)
+    } catch {
+      /* storage unavailable — never nag */
+    }
+  }, [])
+  const dismissStarAsk = useCallback(() => {
+    try {
+      localStorage.setItem('enzo.star-ask.done', '1')
+    } catch {
+      /* ignore */
+    }
+    setStarAskVisible(false)
+  }, [])
   const [codingPhase, setCodingPhase] = useState<{ phase: string; detail: string } | null>(null)
   const [showHistoryDrawer, setShowHistoryDrawer] = useState(false)
   const [historyTab, setHistoryTab] = useState<'text' | 'image'>('text')
@@ -2731,6 +2755,10 @@ Roast Engine  : ${isRoasting ? 'ACTIVE' : 'DISABLED'}`
           'x-auto-fallback': autoFallback ? 'true' : 'false',
           'x-exa-key': keyVault.getItem('enzo.keys.exa') || '',
           'x-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+          // Read-side ownership: the backend only injects a saved project's
+          // on-disk files into the model context when this device id matches
+          // the project's recorded owner (twin of the save-over gate).
+          'x-enzo-owner': getEnzoOwnerId(),
         },
         signal: controller.signal,
         body: JSON.stringify({
@@ -2864,6 +2892,7 @@ Roast Engine  : ${isRoasting ? 'ACTIVE' : 'DISABLED'}`
                 }
                 buildInfoRef.current = nextBuildInfo
                 setBuildInfo(nextBuildInfo)
+                if (nextBuildInfo.ok) maybeShowStarAsk()
               }
             } catch { /* ignore bad payload */ }
             continue
@@ -3229,9 +3258,16 @@ Roast Engine  : ${isRoasting ? 'ACTIVE' : 'DISABLED'}`
       // next save reads it (otherwise concurrent saves fork separate folders).
       const run = projectSaveChainRef.current.then(async () => {
       try {
+        // The save-over gate on the backend requires BOTH the vault session
+        // token and this browser's device id (see src/projects/project.ts) —
+        // streaming re-registrations upsert an existing container, so both
+        // headers must ride along or the save 403s and the preview stalls.
+        const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-enzo-owner': getEnzoOwnerId() }
+        const saveToken = await mintVaultToken()
+        if (saveToken) headers['x-vault-token'] = saveToken
         const res = await fetch('/api/project/save', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           // Send the session's pinned id so this upserts the SAME container
           // instead of forking a new folder on every save. Empty on the first
           // save of a session — the backend mints one and we pin it below.
@@ -3374,17 +3410,15 @@ Roast Engine  : ${isRoasting ? 'ACTIVE' : 'DISABLED'}`
     setProjectList(loadCodeTasks())
     // Best-effort server-side cleanup: projects get their on-disk folder +
     // runtime stopped; html previews get their in-memory entry freed ahead of
-    // its 1-hour TTL (the DELETE carries the vault token when we hold one, so
-    // the server can enforce ownership). Ignore failures either way.
-    if (task.kind === 'project') {
-      fetch(`/api/project/${task.id}`, { method: 'DELETE' }).catch(() => {})
-    } else {
-      mintVaultToken().then((token) => {
-        const headers: Record<string, string> = {}
-        if (token) headers['x-vault-token'] = token
-        return fetch(`/api/preview/${task.id}`, { method: 'DELETE', headers })
-      }).catch(() => {})
-    }
+    // its 1-hour TTL. Both DELETEs carry the vault token + device owner when
+    // we hold them, so the server can enforce ownership. Ignore failures
+    // either way — the local drawer entry is already gone.
+    mintVaultToken().then((token) => {
+      const headers: Record<string, string> = { 'x-enzo-owner': getEnzoOwnerId() }
+      if (token) headers['x-vault-token'] = token
+      const url = task.kind === 'project' ? `/api/project/${task.id}` : `/api/preview/${task.id}`
+      return fetch(url, { method: 'DELETE', headers })
+    }).catch(() => {})
   }, [])
 
   // Edit a saved project: pin it as the coding target (its real on-disk files
@@ -4498,6 +4532,35 @@ Roast Engine  : ${isRoasting ? 'ACTIVE' : 'DISABLED'}`
                   </motion.div>
                 )}
               </AnimatePresence>
+
+              {/* One-time star ask — renders after a build verify passes, at
+                  most once per session and once ever once acted on. */}
+              {starAskVisible && (
+                <div className="flex items-center gap-2 px-4 pt-2.5 text-[11px] text-white/55 border-t border-white/[0.06]">
+                  <Star size={11} className="shrink-0 text-white/50" aria-hidden />
+                  <span className="min-w-0 flex-1">
+                    ENZO is free & open-source — if it built something useful for you today, a star helps other builders find it.
+                  </span>
+                  <a
+                    href="https://github.com/theguysudo/ENZO/stargazers"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={dismissStarAsk}
+                    className="flex shrink-0 items-center gap-1.5 rounded-md border border-white/15 px-2 py-0.5 text-[11px] text-white/80 transition-colors hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+                  >
+                    <Star size={10} />
+                    Star ENZO
+                  </a>
+                  <button
+                    type="button"
+                    onClick={dismissStarAsk}
+                    aria-label="Dismiss star ask"
+                    className="shrink-0 rounded-full p-0.5 text-white/40 transition-colors hover:bg-white/10 hover:text-white/80 cursor-pointer"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              )}
 
               {/* Text input row */}
               <div className="flex items-start gap-3 px-4 pt-3.5 pb-2">

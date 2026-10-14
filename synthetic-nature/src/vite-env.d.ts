@@ -27,3 +27,10 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv
 }
+
+/**
+ * The running ENZO version, injected from the root package.json by Vite's
+ * `define` (see vite.config.ts) — the value the update banner compares the
+ * latest GitHub release tag against.
+ */
+declare const __ENZO_VERSION__: string

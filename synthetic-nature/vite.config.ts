@@ -1,9 +1,17 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
+import { readFileSync } from 'fs'
+
+// The release version the update banner (UpdateBanner.tsx) compares against
+// the latest GitHub release tag. Single source of truth: the root package.json.
+const rootPackage = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'))
 
 export default defineConfig({
   plugins: [react()],
+  define: {
+    __ENZO_VERSION__: JSON.stringify(rootPackage.version),
+  },
   // pdfjs-dist + exceljs are dynamically imported by fileConvert.ts on the
   // first attachment — pre-bundling them here at dev-server start stops Vite
   // from optimizing them mid-session (which forces a page reload).
