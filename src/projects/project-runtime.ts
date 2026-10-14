@@ -71,6 +71,121 @@ export function buildChildEnv(
 const BOOT_TIMEOUT_MS = Number(process.env.ENZO_PROJECT_RUNTIME_BOOT_MS || 7000);
 const IDLE_TIMEOUT_MS = Number(process.env.ENZO_PROJECT_RUNTIME_IDLE_MS || 10 * 60 * 1000);
 
+/**
+ * Runtime-permission sandbox for generated backends.
+ *
+ * The env allowlist in buildChildEnv hides SECRETS from generated code, but the
+ * child still ran as the same OS user as ENZO — it could read .env,
+ * memory-store.json, every other project folder and spawn arbitrary processes.
+ * `node --permission` closes that gap at the runtime level: the child may read
+ * only its project dir + ENZO's node_modules (+ /etc, $TMPDIR) and write only
+ * its project dir + $TMPDIR, and child_process/worker spawning is denied
+ * outright. `--allow-addons` stays open because generated projects legitimately
+ * require native modules (better-sqlite3). Network egress is NOT covered by
+ * the permission model — that boundary still needs an OS/container sandbox
+ * (see SECURITY.md "Runtime isolation roadmap").
+ *
+ * Probed once per process: on a node build without the flag (or an opt-out via
+ * ENZO_RUNTIME_PERMISSIONS=0) the prefix is empty and children run as before.
+ * A boot that fails with an access-denied error retries once without the
+ * sandbox — a generated backend that legitimately needs an odd path must not
+ * brick the preview, and the retry is logged.
+ */
+const PERMISSIONS_DISABLED = process.env.ENZO_RUNTIME_PERMISSIONS === '0';
+
+const LISTEN_PROBE =
+  "const s=require('http').createServer();s.on('error',()=>process.exit(3));s.listen(0,'127.0.0.1',()=>s.close(()=>process.exit(0)))";
+
+function probeNodeArgs(args: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = spawn(process.execPath, [...args, '-e', 'process.exit(0)'], { stdio: 'ignore' });
+    const timer = setTimeout(() => {
+      try { probe.kill('SIGKILL'); } catch { /* already gone */ }
+      resolve(false);
+    }, 3000);
+    timer.unref?.();
+    probe.once('exit', (code) => { clearTimeout(timer); resolve(code === 0); });
+    probe.once('error', () => { clearTimeout(timer); resolve(false); });
+  });
+}
+
+/** Does `args + -e <LISTEN_PROBE>` end with the listener actually listening? */
+function probeListenArgs(args: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = spawn(process.execPath, [...args, '-e', LISTEN_PROBE], { stdio: 'ignore' });
+    const timer = setTimeout(() => {
+      try { probe.kill('SIGKILL'); } catch { /* already gone */ }
+      resolve(false);
+    }, 3000);
+    timer.unref?.();
+    probe.once('exit', (code) => { clearTimeout(timer); resolve(code === 0); });
+    probe.once('error', () => { clearTimeout(timer); resolve(false); });
+  });
+}
+
+// Resolved once per process: [] means "no sandbox available", otherwise the
+// validated flag set every generated child boots with.
+let sandboxPrefixCache: string[] | null = null;
+
+async function resolveSandboxFlags(): Promise<string[]> {
+  if (PERMISSIONS_DISABLED) return [];
+  if (sandboxPrefixCache) return sandboxPrefixCache;
+  if (!(await probeNodeArgs(['--permission']))) {
+    console.warn('[project-runtime] node lacks --permission — generated backends run WITHOUT the runtime sandbox');
+    sandboxPrefixCache = [];
+    return sandboxPrefixCache;
+  }
+  const flags = ['--permission', '--allow-addons'];
+  // Node >= 24 gates network under --permission too: without a net grant the
+  // generated backend cannot even LISTEN on its ephemeral port. The grant is
+  // all-or-nothing on current builds (egress stays possible — that boundary
+  // needs a container, see SECURITY.md), so grant it only when required.
+  if (!(await probeListenArgs(flags))) {
+    if (await probeListenArgs([...flags, '--allow-net'])) {
+      flags.push('--allow-net');
+    } else {
+      console.warn('[project-runtime] generated backends cannot listen under --permission on this node build — runtime sandbox disabled');
+      sandboxPrefixCache = [];
+      return sandboxPrefixCache;
+    }
+  }
+  sandboxPrefixCache = flags;
+  return sandboxPrefixCache;
+}
+
+/** The `node --permission` argv prefix for a child rooted at `projectDir`. */
+export async function sandboxArgs(projectDir: string, tmpDir?: string): Promise<string[]> {
+  const flags = await resolveSandboxFlags();
+  if (flags.length === 0) return [];
+  // Grant paths must be REAL paths: the child's fs calls resolve symlinks
+  // (macOS /tmp → /private/tmp), and a grant on the unresolved path fails the
+  // prefix check — the child would be denied its own project files.
+  const real = (p: string): string => {
+    try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+  };
+  const readRoots = new Set<string>([
+    real(projectDir),
+    real(path.join(process.cwd(), 'node_modules')),
+    real('/etc'),
+  ]);
+  for (const p of NODE_PATH.split(path.delimiter)) {
+    if (p) readRoots.add(real(p));
+  }
+  if (tmpDir) readRoots.add(real(tmpDir));
+  const args = [...flags];
+  for (const r of readRoots) args.push(`--allow-fs-read=${r}`);
+  args.push(`--allow-fs-write=${real(projectDir)}`);
+  if (tmpDir) args.push(`--allow-fs-write=${real(tmpDir)}`);
+  return args;
+}
+
+const PERMISSION_ERROR_RE = /(ERR_ACCESS_DENIED|EACCES|EPERM|AccessDeniedError)/i;
+
+/** True when a failed boot's log looks like the sandbox denied a real need. */
+export function looksLikePermissionError(log: string): boolean {
+  return PERMISSION_ERROR_RE.test(log);
+}
+
 /** Candidate backend entries, most-preferred first. */
 const BACKEND_ENTRIES = [
   'server.js',
@@ -254,53 +369,71 @@ export async function ensureRuntime(projectId: string): Promise<Runtime | null> 
   armIdleShutdown(rt);
 
   // Generated project code gets exactly the env buildChildEnv allows — nothing
-  // else from this process. See the comment there for why.
+  // else from this process. See the comment there for why. On top of the env
+  // allowlist the child runs under the node --permission sandbox (see
+  // sandboxArgs) when the node build supports it.
   const childEnv = buildChildEnv(port, NODE_PATH, projectId, base);
+  const sandboxPrefix = await sandboxArgs(base, process.env.TMPDIR);
 
-  const child = spawn('node', [entry], {
-    cwd: base,
-    env: childEnv,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  rt.child = child;
+  const bootAttempt = async (useSandbox: boolean): Promise<string> => {
+    rt.state = 'starting';
+    rt.error = undefined;
+    const child = spawn('node', [...(useSandbox ? sandboxPrefix : []), entry], {
+      cwd: base,
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    rt.child = child;
+    rt.bootLog = [];
 
-  child.stdout?.on('data', (d) => {
-    const line = String(d).slice(0, 2000);
-    rt.bootLog.push(line);
-    if (rt.bootLog.length > 40) rt.bootLog.shift();
-  });
-  child.stderr?.on('data', (d) => {
-    const line = String(d).slice(0, 2000);
-    rt.bootLog.push(line);
-    if (rt.bootLog.length > 40) rt.bootLog.shift();
-  });
+    child.stdout?.on('data', (d) => {
+      const line = String(d).slice(0, 2000);
+      rt.bootLog.push(line);
+      if (rt.bootLog.length > 40) rt.bootLog.shift();
+    });
+    child.stderr?.on('data', (d) => {
+      const line = String(d).slice(0, 2000);
+      rt.bootLog.push(line);
+      if (rt.bootLog.length > 40) rt.bootLog.shift();
+    });
 
-  child.once('exit', (code, signal) => {
-    if (runtimes.get(projectId) === rt) {
-      const log = rt.bootLog.join('').trim() || 'no output';
-      if (rt.state === 'starting') {
-        rt.state = 'failed';
-        rt.error = `backend exited during boot (code=${code ?? 'null'}, signal=${signal ?? 'null'})\n${log.slice(-400)}`;
-        console.error(`[project-runtime] ${projectId} boot failed:\n${rt.error}`);
-      } else {
-        // Crashed after running — mark dead; next request re-boots.
-        killRuntime(projectId, `exited code=${code ?? signal ?? '?'}`);
+    // Guard on rt.child: a killed first attempt's exit event must not be
+    // misread as the second attempt's failure.
+    child.once('exit', (code, signal) => {
+      if (rt.child !== child) return;
+      if (runtimes.get(projectId) === rt) {
+        const log = rt.bootLog.join('').trim() || 'no output';
+        if (rt.state === 'starting') {
+          rt.state = 'failed';
+          rt.error = `backend exited during boot (code=${code ?? 'null'}, signal=${signal ?? 'null'})\n${log.slice(-400)}`;
+          console.error(`[project-runtime] ${projectId} boot failed:\n${rt.error}`);
+        } else {
+          // Crashed after running — mark dead; next request re-boots.
+          killRuntime(projectId, `exited code=${code ?? signal ?? '?'}`);
+        }
       }
-    }
-  });
+    });
 
-  try {
-    await waitForListening(port, BOOT_TIMEOUT_MS);
-    rt.state = 'running';
-    console.log(`[project-runtime] ${projectId} running on 127.0.0.1:${port} (entry ${entry})`);
-    return rt;
-  } catch (e) {
-    child.kill('SIGKILL');
-    rt.state = 'failed';
-    rt.error = e instanceof Error ? e.message : String(e);
-    console.error(`[project-runtime] ${projectId} boot failed: ${rt.error}`);
-    return rt;
+    try {
+      await waitForListening(port, BOOT_TIMEOUT_MS);
+      rt.state = 'running';
+      console.log(`[project-runtime] ${projectId} running on 127.0.0.1:${port} (entry ${entry}${useSandbox ? ', sandboxed' : ''})`);
+      return '';
+    } catch (e) {
+      child.kill('SIGKILL');
+      rt.state = 'failed';
+      rt.error = e instanceof Error ? e.message : String(e);
+      console.error(`[project-runtime] ${projectId} boot failed: ${rt.error}`);
+      return rt.bootLog.join('');
+    }
+  };
+
+  const sandboxLog = await bootAttempt(sandboxPrefix.length > 0);
+  if (sandboxPrefix.length > 0 && sandboxLog && looksLikePermissionError(sandboxLog)) {
+    console.warn(`[project-runtime] ${projectId} boot failed under the runtime-permission sandbox — retrying without it`);
+    await bootAttempt(false);
   }
+  return rt;
 }
 
 export function getRuntimeStatus(projectId: string) {

@@ -72,6 +72,7 @@ import { startHealthMonitor, getHealthStore, probeModelHealth, recordModelFailur
 import { getVaultEnvKeys, readEnvFile, saveVaultKeysToEnv, VAULT_TO_ENV_MAP } from 'src/core/env-manager.js';
 import { initVaultBoot, isSelfHostedInstance, serverHoldsNoProviderKeys, persistClaimedKey, CLAIMABLE_PROVIDERS } from 'src/core/vault-boot.js';
 import { vaultSessionToken, vaultTokenIsValid } from 'src/core/vault-token.js';
+import { rateLimit } from 'src/core/rate-limit.js';
 import { runAgentLoop, type ToolCtx, type ProviderConfig, findMatchingDraft } from 'src/agent/agent-tools.js';
 import { buildMemoryContext, recordMemory, getMemoryEntries, clearMemory, rememberFact, forgetMemory, getFacts, isRememberIntent, extractFactFromMessage, isForgetIntent, extractForgetQuery, isListMemoryIntent, isContinueIntent } from 'src/core/memory.js';
 import { listSkills, getSkill, deleteSkill, learnSkillFromRepo, importBundledSkillsFromRepo, buildSkillContext, SkillSignalFilter, extractRepoUrl } from 'src/skills/skills.js';
@@ -79,7 +80,7 @@ import { buildCodingSkillContext, loadBundledSkills } from 'src/skills/bundled-s
 import { UiSearchSignalFilter, runUiSearch } from 'src/features/ui-ux-search.js';
 import { acquireProvider, markProviderCooldown, isProviderCooledDown, providerCooldownMs, dailyRemaining, rpmUsed, softRpmLimit, streamPauseMs, streamPauseNeeded } from 'src/models/throttle.js';
 import { registerPreview, getPreview, deletePreview } from 'src/core/preview.js';
-import { projectRouter, readProjectFiles } from 'src/projects/project.js';
+import { projectRouter, readProjectFiles, checkProjectReadAccess } from 'src/projects/project.js';
 import { stopAllRuntimes } from 'src/projects/project-runtime.js';
 import { extractProjectFiles, verifyProject, buildRepairContext, renderBuildReport } from 'src/core/build-verify.js';
 
@@ -165,38 +166,9 @@ app.use((_req, res, next) => {
 app.use(express.json({ limit: '12mb' }));
 
 // ── Rate limiting (in-memory per-IP token bucket, no external dependency) ────
-// ponytail: one Map in this process, so limits are per-instance and reset on
-// restart. Correct for the single-instance deployment this ships as, and it
-// keeps Redis out of the dependency list. The moment there are two instances
-// behind one hostname a client gets N× the limit — that is the trigger to move
-// the bucket into a shared store, not before.
-const RATE_LIMIT_BUCKETS = new Map<string, { count: number; reset: number }>();
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of RATE_LIMIT_BUCKETS) {
-    if (v.reset <= now) RATE_LIMIT_BUCKETS.delete(k);
-  }
-
-}, 60_000).unref();
-
-function rateLimit(bucket: string, maxPerMin: number) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction): void => {
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    const id = `${bucket}:${ip}`;
-    const now = Date.now();
-    let slot = RATE_LIMIT_BUCKETS.get(id);
-    if (!slot || slot.reset <= now) {
-      slot = { count: 0, reset: now + 60_000 };
-      RATE_LIMIT_BUCKETS.set(id, slot);
-    }
-    slot.count += 1;
-    if (slot.count > maxPerMin) {
-      res.status(429).json({ error: 'rate_limited' });
-      return;
-    }
-    next();
-  };
-}
+// Lives in src/core/rate-limit.ts so projects/project.ts can throttle
+// /api/project/save with the same limiter; the bucket shape and the
+// single-instance caveat documented there are unchanged.
 
 // ── Primary frontend: synthetic-nature (React/Vite) runs on port 5173 ────────
 // This Express server (port 5001) is API-only. All frontend assets are served
@@ -4205,7 +4177,17 @@ Do NOT ask for details again. Do NOT respond with text. CALL THE TOOL IMMEDIATEL
         // (even on the FIRST message of a session, so editing an older saved
         // project starts from its real code instead of a blank restart).
         const projectId = String(body.projectId || '').replace(/[^a-zA-Z0-9_-]/g, '');
-        if (chatMode === 'coding' && projectId) {
+        // Read-side twin of the save-over gate: a project with a recorded
+        // device owner only injects its files for the SAME device — otherwise
+        // a chat request naming a foreign projectId would pull another user's
+        // code into this conversation. Legacy/anonymous projects (no recorded
+        // owner) keep the id-as-capability grant.
+        const chatOwnerHeader = (req.headers['x-enzo-owner'] ?? '').toString();
+        const projectReadAllowed = !projectId || checkProjectReadAccess(projectId, chatOwnerHeader);
+        if (chatMode === 'coding' && projectId && !projectReadAllowed) {
+          console.warn(`[chat] project ${projectId} injection denied — request device does not match the recorded owner`);
+        }
+        if (chatMode === 'coding' && projectId && projectReadAllowed) {
           let diskFiles = readProjectFiles(projectId);
           // Fallback when the container isn't on disk (a preview-only task that
           // was never saved as a project folder, or the folder was deleted):

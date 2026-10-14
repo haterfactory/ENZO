@@ -25,6 +25,7 @@ import {
   stopRuntime,
 } from '../projects/project-runtime.js';
 import { vaultTokenIsValid } from '../core/vault-token.js';
+import { rateLimit } from '../core/rate-limit.js';
 
 const PROJECTS_DIR = path.join(process.cwd(), 'generated-projects');
 const MAX_FILES = 60;
@@ -161,6 +162,29 @@ export interface SavedProject {
   ownerToken?: string; // Vault session token of the project owner
 }
 
+// Device identity bound into project ownership (see checkProjectOwnership).
+// The frontend persists a random id in localStorage and sends it as the
+// `x-enzo-owner` header on save/delete/manifest calls.
+const OWNER_ID_RE = /^[a-zA-Z0-9_-]{8,64}$/;
+
+function sanitizeOwnerId(value: unknown): string | undefined {
+  const v = String(value ?? '').trim();
+  return OWNER_ID_RE.test(v) ? v : undefined;
+}
+
+/** The ownerId recorded in a project's manifest, or null for legacy/anonymous
+ *  projects saved before device ownership existed (and for missing manifests). */
+function readManifestOwnerId(projectId: string): string | null {
+  const id = String(projectId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!id) return null;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(PROJECTS_DIR, id, 'manifest.json'), 'utf8'));
+    return typeof manifest?.ownerId === 'string' && OWNER_ID_RE.test(manifest.ownerId) ? manifest.ownerId : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Persist a { path: content } file map to disk and return the project handle.
  *
  * With `id` provided this is an UPSERT into the SAME project container (a
@@ -172,7 +196,13 @@ export interface SavedProject {
  * ponytail: merge-only; if a full rebuild ever needs to delete dropped files,
  * add an explicit `fullSnapshot` flag on the caller and prune only then.
  */
-export async function saveProject(files: Record<string, string>, title?: string, id?: string, ownerToken?: string): Promise<SavedProject> {
+export async function saveProject(
+  files: Record<string, string>,
+  title?: string,
+  id?: string,
+  ownerToken?: string,
+  ownerId?: string,
+): Promise<SavedProject> {
   // Use lock to prevent race conditions during project creation/upsert
   const lockKey = id ? `project:${id}` : 'project:create';
   return await withLock(lockKey, async () => {
@@ -228,9 +258,15 @@ export async function saveProject(files: Record<string, string>, title?: string,
   if (backendEntry) {
     result.backend = { entry: backendEntry, base: `/api/project/${projectId}/backend` };
   }
-  // Write manifest.json with ownerToken
+  // Write manifest.json with ownerToken + ownerId. Claim semantics: an update
+  // never clobbers a recorded owner — the first authorized update of a legacy
+  // or anonymous-created project is what records one.
+  const manifestOwner = ownerId ?? readManifestOwnerId(projectId) ?? undefined;
   const manifestPath = path.join(base, 'manifest.json');
-  fs.writeFileSync(manifestPath, JSON.stringify({ ownerToken, title: result.title, id: projectId }, null, 2));
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({ ownerToken, ownerId: manifestOwner, title: result.title, id: projectId }, null, 2),
+  );
   return result;
   });
 }
@@ -253,14 +289,23 @@ export function projectExists(projectId: string): boolean {
   return !!id && fs.existsSync(path.join(PROJECTS_DIR, id));
 }
 
-/** Check if the request's vault token matches the project's owner token */
-export function checkProjectOwnership(projectId: string, vaultToken: string | undefined): boolean {
-  // Owned operations (delete, manifest) are frontend-driven with a minted
-  // vault token: a browser holding any valid provider key. The old raw compare
-  // against the save-time token 403'd the owner once the 12h token window
-  // rolled over, and locked out legacy projects with no owner token at all.
-  // The project id stays the unlisted capability.
-  return !!vaultToken && vaultTokenIsValid(vaultToken);
+/** Check if the request may manage this project (delete, manifest, save-over). */
+export function checkProjectOwnership(projectId: string, vaultToken: string | undefined, ownerId?: string): boolean {
+  // Two-layer gate. Layer 1 — a currently-valid vault token (current or
+  // previous 12h window): proves the browser holds a live provider key. The
+  // old raw compare against the save-time token 403'd the owner once the
+  // window rolled over and locked out legacy projects with no owner token at
+  // all. Layer 2 — device identity: the vault token formula is instance-wide,
+  // so on a shared instance every user mints the SAME token and the token
+  // alone cannot tell users apart. Projects saved since 2026-10 also record
+  // the creator's `x-enzo-owner` device id in manifest.json, and a recorded
+  // owner only matches the same id. Legacy projects (no recorded owner) keep
+  // the token-only grant; the headerless preview/document routes stay
+  // credential-free (the id is the unlisted capability there, as before).
+  if (!vaultToken || !vaultTokenIsValid(vaultToken)) return false;
+  const stored = readManifestOwnerId(projectId);
+  if (!stored) return true;
+  return !!ownerId && ownerId === stored;
 }
 
 /** Middleware to enforce project ownership */
@@ -271,11 +316,24 @@ export function requireProjectOwnership(req: any, res: any, next: any) {
     return;
   }
   const vaultToken = (req.headers['x-vault-token'] ?? '').toString().trim() || undefined;
-  if (!checkProjectOwnership(id, vaultToken)) {
+  const ownerId = sanitizeOwnerId(req.headers['x-enzo-owner']);
+  if (!checkProjectOwnership(id, vaultToken, ownerId)) {
     res.status(403).json({ error: 'forbidden', message: 'You do not have access to this project' });
     return;
   }
   next();
+}
+
+/** Read-side twin of checkProjectOwnership: may a chat request naming this
+ *  projectId have the project's files injected into its model context? A
+ *  recorded device owner only matches the same `x-enzo-owner` value; legacy
+ *  or anonymous-created projects (no recorded owner) keep the
+ *  id-as-capability grant. */
+export function checkProjectReadAccess(projectId: string, rawOwnerId: unknown): boolean {
+  const stored = readManifestOwnerId(projectId);
+  if (!stored) return true;
+  const owner = sanitizeOwnerId(rawOwnerId);
+  return !!owner && owner === stored;
 }
 
 /**
@@ -328,7 +386,14 @@ export const projectRouter = Router();
 // Save a project: { files: { "path/name.ext": "content" }, title?, id? }.
 // Passing `id` upserts into that same container (streaming re-registrations
 // and "continue" turns keep ONE stable project instead of spawning clones).
-projectRouter.post('/api/project/save', async (req: any, res: any) => {
+//
+// Creating a NEW container stays open (the same capability model as
+// /api/preview — the returned id is the grant). Upserting into an EXISTING
+// one is a write into someone's saved workspace and is gated: a valid vault
+// token, plus the recorded x-enzo-owner device id when the manifest has one.
+// (The 2026-10 audit flagged this route as a cross-user overwrite: any caller
+// who knew an id could replace every file and re-stamp the manifest.)
+projectRouter.post('/api/project/save', rateLimit('project-save', 60), async (req: any, res: any) => {
   const files = req.body?.files;
   if (!files || typeof files !== 'object' || Array.isArray(files)) {
     res.status(400).json({ error: 'bad_request', message: 'Missing files object' });
@@ -346,9 +411,22 @@ projectRouter.post('/api/project/save', async (req: any, res: any) => {
     return;
   }
   const requestedId = String(req.body?.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
-  // Extract vault token from headers for project ownership
+  // Extract vault token + device owner from headers for project ownership
   const ownerToken = (req.headers['x-vault-token'] ?? '').toString().trim() || undefined;
-  const project = await saveProject(Object.fromEntries(fileEntries), req.body?.title, requestedId || undefined, ownerToken);
+  const callerOwner = sanitizeOwnerId(req.headers['x-enzo-owner']);
+  let ownerIdForSave = callerOwner;
+  if (requestedId && projectExists(requestedId)) {
+    if (!ownerToken || !vaultTokenIsValid(ownerToken)) {
+      res.status(403).json({ error: 'forbidden', message: 'Saving over an existing project requires a valid vault session' });
+      return;
+    }
+    const storedOwner = readManifestOwnerId(requestedId);
+    if (storedOwner && callerOwner !== storedOwner) {
+      res.status(403).json({ error: 'forbidden', message: 'This project belongs to a different ENZO device' });
+      return;
+    }
+  }
+  const project = await saveProject(Object.fromEntries(fileEntries), req.body?.title, requestedId || undefined, ownerToken, ownerIdForSave);
   res.json(project);
 });
 

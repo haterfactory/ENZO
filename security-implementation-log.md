@@ -89,3 +89,69 @@ The system was tested to ensure:
 
 ### Status
 Implementation complete and verified.
+---
+
+## 2026-10-14 — External audit remediation: project write authorization, generated-code sandbox, save throttling
+
+### Findings addressed
+
+An external security/UX audit of the v1.4.0 tree confirmed three code-level
+gaps, all fixed here:
+
+1. `POST /api/project/save` accepted an existing project `id` from any caller
+   and overwrote the files — no token check, and the save-time `ownerToken`
+   written into `manifest.json` was never read anywhere, so an attacker who
+   learned an id could replace every file and re-stamp the manifest.
+2. `checkProjectOwnership()` treated any currently-valid vault token as the
+   owner. That token is an instance-wide HMAC, so on a shared instance every
+   user mints the SAME token and it cannot tell users apart.
+3. Generated `server.js` backends ran as unsandboxed children: the env
+   allowlist hid secrets, but the code could read ENZO's own files (`.env`,
+   `memory-store.json`, other projects) and spawn arbitrary processes.
+
+### Changes Made
+
+1. `src/projects/project.ts` — save-over gate + device ownership:
+   - Upserting into an EXISTING project now requires a valid vault token
+     AND a match on the manifest's recorded `ownerId` (the creator's
+     `x-enzo-owner` device id). New/anonymous creation stays open (the
+     returned id is the grant, same capability model as /api/preview).
+   - Legacy projects (no recorded owner) keep the token-only grant; the
+     first authorized updater claims the device id, later devices 403.
+   - Updates never clobber a recorded owner; delete/manifest gated the
+     same way via `requireProjectOwnership`.
+2. `src/lib/enzoOwner.ts` (frontend) + `TerminalSection.tsx` — browsers
+   persist a random device id and send it as `x-enzo-owner` on project
+   save/delete; project DELETEs now actually carry the vault token (they
+   previously sent neither header, so server-side cleanup always 403'd).
+3. `src/projects/project-runtime.ts` + `src/core/build-verify.ts` —
+   generated backends (live runtime AND boot checks) spawn under
+   `node --permission`: fs reads restricted to the project dir +
+   node_modules + /etc + $TMPDIR, writes to project dir + $TMPDIR,
+   child_process denied, `--allow-addons` open for better-sqlite3.
+   Flag support probed once; a permission-denied boot retries once
+   without the sandbox; `ENZO_RUNTIME_PERMISSIONS=0` opts out entirely.
+4. `src/core/rate-limit.ts` (extracted verbatim from index.ts) —
+   `/api/project/save` is now rate-limited (60/min per IP); index.ts
+   imports the shared limiter.
+
+### What is deliberately NOT fixed here
+
+- Network egress from generated backends: the Node permission model does
+  not cover sockets. OS/container-level isolation is the roadmap item.
+
+### Follow-up (same day): chat-context read gate
+
+The chat pipeline injected another project's files whenever a request named
+its `projectId` — an id-holder could pull another user's code into their own
+model context. `checkProjectReadAccess()` (read-side twin of the save gate)
+now requires the recorded `x-enzo-owner` device id on recorded-owner
+projects; legacy/anonymous projects keep the id-as-capability grant. The
+frontend chat request sends the device id header.
+
+### Verification
+
+- `tests/project-idor.test.ts` extended: anonymous/wrong-token/cross-device
+  save-overs 403 with files untouched, owner update lands in the same
+  container, legacy claim sticks, delete/manifest device-gated, CSP sandbox
+  header present, 62-save burst trips the rate limiter. Full suite green.

@@ -25,7 +25,7 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 
-import { backendNodePath, buildChildEnv } from '../projects/project-runtime';
+import { backendNodePath, buildChildEnv, sandboxArgs, looksLikePermissionError } from '../projects/project-runtime';
 
 const execFileAsync = promisify(execFile);
 
@@ -190,40 +190,61 @@ export async function bootCheckBackend(files: FileEntry[]): Promise<BackendBoot>
   // real node_modules (process.cwd(), not __dirname — that's src/core, which has
   // no node_modules and silently broke module resolution for boot checks).
   const childEnv = buildChildEnv(port, backendNodePath());
-
-  let childLog = '';
-  const child = spawn(process.execPath, [entryInfo!.name], {
-    cwd: scratch,
-    env: childEnv,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  child.stdout!.on('data', (d: Buffer) => (childLog += d.toString()));
-  child.stderr!.on('data', (d: Buffer) => (childLog += d.toString()));
-  child.on('exit', () => { /* read after timeout below */ });
+  // Same runtime-permission sandbox as the live project-runtime spawn — a
+  // backend that boots here must behave exactly as it will behind the proxy,
+  // sandbox included. A permission-denied boot retries once without the
+  // sandbox so a genuinely path-hungry backend still passes the check.
+  const sandboxPrefix = await sandboxArgs(scratch, os.tmpdir());
 
   const BOOT_TIMEOUT_MS = 8000;
-  const deadline = Date.now() + BOOT_TIMEOUT_MS;
-  let status = 0;
-  try {
-    while (Date.now() < deadline) {
-      if (child.exitCode !== null) break;
-      status = await httpGetOnce(port, '/api/health', 1200);
-      if (status === 0) status = await httpGetOnce(port, '/', 1200);
-      if (status >= 200 && status < 500) {
-        return { ok: true, detail: `booted on port ${port}, /api/health → ${status}` };
+
+  const attempt = async (useSandbox: boolean): Promise<{ ok: boolean; detail?: string; log: string }> => {
+    let childLog = '';
+    const child = spawn(process.execPath, [...(useSandbox ? sandboxPrefix : []), entryInfo!.name], {
+      cwd: scratch,
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout!.on('data', (d: Buffer) => (childLog += d.toString()));
+    child.stderr!.on('data', (d: Buffer) => (childLog += d.toString()));
+    child.on('exit', () => { /* read after timeout below */ });
+
+    const deadline = Date.now() + BOOT_TIMEOUT_MS;
+    let status = 0;
+    let ok = false;
+    try {
+      while (Date.now() < deadline) {
+        if (child.exitCode !== null) break;
+        status = await httpGetOnce(port, '/api/health', 1200);
+        if (status === 0) status = await httpGetOnce(port, '/', 1200);
+        if (status >= 200 && status < 500) {
+          ok = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
       }
-      await new Promise((r) => setTimeout(r, 250));
+    } finally {
+      child.kill('SIGKILL');
     }
+
+    if (ok) return { ok: true, detail: `booted on port ${port}, /api/health → ${status}`, log: childLog };
+    const tail = childLog.split('\n').filter(Boolean).slice(-8).join('\n').trim().slice(0, 600);
+    const reason = child.exitCode !== null
+      ? `backend crashed at startup (exit ${child.exitCode})`
+      : `backend did not answer on port ${port} within ${BOOT_TIMEOUT_MS / 1000}s`;
+    return { ok: false, detail: `${reason}${tail ? ` — log:\n${tail}` : ''}`, log: childLog };
+  };
+
+  try {
+    let result = await attempt(sandboxPrefix.length > 0);
+    if (!result.ok && sandboxPrefix.length > 0 && looksLikePermissionError(result.log)) {
+      console.warn('[build-verify] boot check failed under the runtime-permission sandbox — retrying without it');
+      result = await attempt(false);
+    }
+    return { ok: result.ok, detail: result.detail };
   } finally {
-    child.kill('SIGKILL');
     fs.rmSync(scratch, { recursive: true, force: true });
   }
-
-  const tail = childLog.split('\n').filter(Boolean).slice(-8).join('\n').trim().slice(0, 600);
-  const reason = child.exitCode !== null
-    ? `backend crashed at startup (exit ${child.exitCode})`
-    : `backend did not answer on port ${port} within ${BOOT_TIMEOUT_MS / 1000}s`;
-  return { ok: false, detail: `${reason}${tail ? ` — log:\n${tail}` : ''}` };
 }
 
 /**
