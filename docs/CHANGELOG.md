@@ -1,5 +1,36 @@
 # ENZO Project Changelog
 
+## [2026-10-14] — v1.6.0: external audit remediation — project write authorization, a runtime sandbox for generated code, and a quiet developer-tool preview
+
+Backend tsc + frontend tsc + vite build green; the full test suite (10 files) green; the IDOR suite extended from 3 sections to 7 and passing; the generated-backend sandbox live-verified against a fixture backend.
+
+### What was broken / missing
+
+An external security/UX audit of the v1.5.0 tree, verified line-by-line against the source before acting. Three code-level findings were confirmed:
+
+1. **`POST /api/project/save` let anyone overwrite any project.** The route accepted an existing project `id` from any caller with no authorization at all — and the save-time `ownerToken` written into `manifest.json` was never read by anything, so "ownership" was decorative. Anyone who learned an id could replace every file and re-stamp the manifest.
+2. **The vault token could not tell users apart.** `checkProjectOwnership()` granted management to any currently-valid vault token, but the token formula is instance-wide — every user of a shared instance mints the SAME per-window HMAC. On a multi-user host, "authenticated" meant nothing for project isolation. The same gap existed on reads: a chat request naming a foreign `projectId` had that project's files injected into the attacker's own model context.
+3. **Generated backends ran unsandboxed.** The env allowlist hid secrets from LLM-written `server.js`, but the child still ran as the same OS user with the same filesystem view: it could read `.env`, `memory-store.json` and every other project folder, and spawn arbitrary processes.
+
+The audit's UX finding matched too: the preview panel was a visual experience (turbulence filters, drifting smears, vignette, sheen sweep) competing with the app it exists to inspect, with a permanent fake "running" chip, 10px uppercase chrome and a `min-w-[360px]` that overflowed small screens.
+
+### The fix
+
+- **Device ownership on projects** (`src/projects/project.ts`, frontend `src/lib/enzoOwner.ts`): each browser persists a random device id, sent as `x-enzo-owner`. Upserting into an EXISTING project now requires a valid vault token AND the manifest's recorded owner id; delete/manifest enforce the same pair. New/anonymous creation stays open (the returned id is the capability, same model as `/api/preview`). Legacy projects (no recorded owner) keep the token-only grant; the first authorized updater claims the device id. Updates never clobber a recorded owner.
+- **Read-side twin for chat context** (`index.ts`): a project with a recorded owner only injects its files into a chat request's model context when the request's device id matches. The frontend chat call sends the header.
+- **A real sandbox for generated code** (`src/projects/project-runtime.ts`, `src/core/build-verify.ts`): generated backends — the live runtime AND build-verify boot checks — spawn under `node --permission`. Filesystem reads are restricted to the project dir, `node_modules`, `/etc` and `$TMPDIR`; writes to the project dir and `$TMPDIR`; `child_process` is denied; `--allow-addons` stays open for `better-sqlite3`. Node ≥ 24 gates network under `--permission` too, so the probe grants `--allow-net` only on builds that need it (the flag is all-or-nothing — egress containment remains the container-boundary roadmap item). Flag support is probed once per process; a permission-denied boot retries once unsandboxed so a path-hungry backend can't brick the preview; `ENZO_RUNTIME_PERMISSIONS=0` opts out. Grant paths are real-pathed (macOS `/tmp` → `/private/tmp` otherwise denied the child its own files — caught by the live fixture run).
+- **Save throttling** (`src/core/rate-limit.ts`, extracted verbatim from `index.ts`): `/api/project/save` is rate-limited per IP (60/min). The frontend's own 1.5s save cadence never reaches the cap.
+- **Preview panel rebuilt** (`PreviewPanel.tsx`): flat surface, thin ring, a real URL field, five icon actions with `aria-label`s and focus rings, the fake "running" pill removed, file paths as clickable plain text (click loads that file in the frame; reload returns to the entry), `prefers-reduced-motion` respected throughout, full-width sheet under 720px instead of a forced 360px-min dock. The iframe `sandbox` attrs and the CSP header on served pages are untouched (S5 of the audit — kept, now regression-tested).
+- **Release notices in-app** (`UpdateBanner.tsx`): self-hosters get a dismissible bottom-left banner when the latest GitHub release is newer than the running build (`__ENZO_VERSION__` injected from the root package.json via Vite `define`; 24h sessionStorage cache; one unauthenticated API call a day; silent on failure; per-version dismissal).
+- **One-time star ask** (TerminalSection): after a build verify PASSES, a single slim strip above the composer — "ENZO is free & open-source — if it built something useful for you today, a star helps other builders find it." Capped at once per session and once ever once acted on. No nagging loops, no gating.
+- **Quickstart case fix** (README): `cd enzo` → `cd ENZO` — on case-sensitive filesystems the old line failed the very first command a Linux cloner ran.
+
+### Verified
+
+- Sandbox containment, live fixture: reading `.env` / `memory-store.json` / other projects → `ERR_ACCESS_DENIED`; own project files + `node_modules` → allowed; `execFile` → denied; health endpoint answers on its loopback port. The real project-hosting test path now boots `(entry server.js, sandboxed)` with no fallback.
+- IDOR suite extended: anonymous/wrong-token/cross-device save-overs 403 with files untouched; the owner's update lands in the SAME container; the legacy claim sticks; delete/manifest are device-gated; read access is device-gated; the CSP sandbox header is present; a 62-save burst trips the limiter.
+- Backend tsc, frontend tsc, vite build, full `npm test` (10 suites) green.
+
 ## [2026-10-07] — traffic badges fixed: true all-time totals + a docker pulls badge
 
 All uncommitted (awaiting review). The render script run-verified locally against the live traffic API and the public package page.

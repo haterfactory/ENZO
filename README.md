@@ -19,7 +19,7 @@
   <a href="https://enzo-hub.duckdns.org">Live demo</a> ·
   <a href="#six-surfaces-one-workspace">What's inside</a> ·
   <a href="#security">Security</a> ·
-  <a href="#whats-new-in-v140">What's new</a> ·
+  <a href="#whats-new-in-v160">What's new</a> ·
   <a href="#usage-guide">Usage guide</a> ·
   <a href="docs/CHANGELOG.md">Changelog</a>
 </p>
@@ -65,10 +65,12 @@
 
 ```bash
 git clone https://github.com/theguysudo/ENZO.git
-cd enzo
+cd ENZO
 docker compose up -d
 # → http://localhost:5001
 ```
+
+ENZO is MIT-licensed and free forever. If it saves you time, [a star](https://github.com/theguysudo/ENZO/stargazers) genuinely helps other builders find it.
 
 No clone? One command (mounts the same named volumes, so your data and the claimed instance survive restarts and upgrades):
 
@@ -157,7 +159,18 @@ The full threat model is written down — checkable, with the code that makes ea
 - **Every push runs a 44-assertion black-box pentest** against a booted server — auth bypass, hostile payloads, IDOR, stream integrity — plus a keyless-boot proof: the server must start with zero provider keys. That's the BYOK guarantee, tested, not promised.
 - **The limits are stated up front.** Self-hosted mode stores the first key you claim in the container `.env` (sealed in the memory volume) so scheduled agents can run while your browser is closed — that trade is documented, not hidden. [docs/SECURITY.md](docs/SECURITY.md) covers what's protected, what isn't, and why.
 
-## What's new in v1.4.0
+## What's new in v1.6.0
+
+An external security & UX audit of the v1.5.0 tree, acted on in full — plus a preview panel that finally behaves like an IDE, not an AI landing page.
+
+- **Projects are truly yours.** Writing into an existing saved project (save-over, delete, manifest) now requires a valid vault session **and** the creator's device identity — on a shared instance, a user who knows (or guesses) a project id can no longer overwrite or read another user's work. New project creation stays open; legacy projects keep working and are claimed on first authorized update.
+- **Generated backends run sandboxed.** The `server.js` ENZO spawns from your prompts now boots under Node's runtime permission model: it can read its own project files and ENZO's `node_modules`, and nothing else — app secrets, the vault store and other projects return access-denied, and spawning subprocesses is blocked. Boot failures under the sandbox retry once unsandboxed and are logged; `ENZO_RUNTIME_PERMISSIONS=0` opts out.
+- **Save throttling** — `/api/project/save` is rate-limited per IP (60/min), closing the disk-exhaustion path the audit flagged.
+- **A quiet developer-tool preview** — the paper-texture panel (wrinkle filters, drifting smears, sheen sweeps) is gone: a flat surface, a real URL field, icon actions with focus rings and screen-reader labels, a clickable file strip that loads any project file in the frame, reduced-motion support, and a full-width sheet on small screens. The iframe sandbox is untouched.
+- **Release notices in-app** — self-hosters get a small dismissible banner when a newer ENZO release is out (checks GitHub's public API at most once a day; silent when offline).
+- **The 10-second quickstart bug that could block Linux users is fixed** — `cd ENZO`, matching what `git clone` actually creates on case-sensitive filesystems.
+
+## What's new in v1.4.0 (previous)
 
 - **In-chat file converter** — attach a PDF, spreadsheet, CSV, JSON, TXT or Markdown file in the terminal chat and it's parsed to real text/rows in your browser (files never leave the device; only the reasoning step uses your own key, like normal chat). The agent extracts, merges, or cross-converts — and **CSV / Excel download buttons appear right on the reply**. Built for research papers: "extract every table and merge into one CSV" now works end to end, and scanned PDFs report their missing text layer instead of failing.
 - **Run it on Google Colab** — one click on the **Open In Colab** button (see [Run on Google Colab](#run-on-google-colab--zero-install)): the notebook clones, installs, builds and boots ENZO on Google's hardware, hands you a URL for your browser plus a tunnel URL for your phone, and arms a keep-alive + watchdog so it stays up for 6+ hours.
