@@ -10,8 +10,8 @@
 
 | Snapshot | Views | Unique visitors | Clones | Unique cloners | Stars |
 |---|---|---|---|---|---|
-| last 14 days | 285 | 127 | 793 | 205 | 113 |
-| all time | 3286 | — | 2410 | — | 113 |
+| last 14 days | 285 | 127 | 793 | 205 | 114 |
+| all time | 3286 | — | 2410 | — | 114 |
 
 Docker pulls ([ghcr.io/theguysudo/enzo](https://github.com/theguysudo/ENZO/pkgs/container/enzo)): **146**
 
