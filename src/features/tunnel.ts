@@ -56,6 +56,8 @@ export function getProviderKey(provider: string): string {
       return process.env.PUTER_AUTH_TOKEN || '';
     case 'cloudflare':
       return process.env.CLOUDFLARE_API_TOKEN || '';
+    case 'custom':
+      return process.env.CUSTOM_API_KEY || '';
     default:
       return '';
   }
@@ -72,6 +74,7 @@ const PROVIDER_ENDPOINTS = {
   google: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', // Google Gemini (OpenAI-compat)
   puter: 'https://api.puter.com/puterai/openai/v1/chat/completions', // Puter user-pays gateway
   cloudflare: 'https://api.cloudflare.com/client/v4', // Cloudflare Workers AI (base — chat endpoint built from account id)
+  custom: '', // no built-in endpoint — operator-configured base URL (see customEndpoint)
 } as const;
 
 // Runtime-settable base URL for LLM7 (env LLM7_API_BASE_URL). Stored beside the
@@ -88,6 +91,16 @@ function cloudflareChatEndpoint(): string {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID || '';
   if (!account) return '';
   return `https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1/chat/completions`;
+}
+
+// The custom source (issue #14) has no built-in endpoint: the operator's base
+// URL comes from the x-custom-base-url header or CUSTOM_API_BASE_URL. Returns
+// '' when unconfigured — parseModelRoute turns that into a clear 400.
+function customEndpoint(req: Request): string {
+  const base = String(req.headers['x-custom-base-url'] || process.env.CUSTOM_API_BASE_URL || '')
+    .trim()
+    .replace(/\/+$/, '');
+  return base ? `${base}/chat/completions` : '';
 }
 
 type Provider = keyof typeof PROVIDER_ENDPOINTS;
@@ -161,6 +174,7 @@ function parseModelRoute(modelString: string, req: Request): ParsedRoute {
     { prefix: 'google/', provider: 'google' }, // Google Gemini (OpenAI-compat)
     { prefix: 'puter/', provider: 'puter' }, // Puter user-pays gateway
     { prefix: 'cloudflare/', provider: 'cloudflare' }, // Cloudflare Workers AI
+    { prefix: 'custom/', provider: 'custom' }, // Generic OpenAI-compatible endpoint (operator-configured)
   ];
 
   for (const { prefix, provider } of prefixes) {
@@ -214,6 +228,14 @@ function parseModelRoute(modelString: string, req: Request): ParsedRoute {
           accountOverride || process.env.CLOUDFLARE_ACCOUNT_ID
             ? `https://api.cloudflare.com/client/v4/accounts/${accountOverride || process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions`
             : cloudflareChatEndpoint();
+      } else if (provider === 'custom') {
+        if (req.headers['x-custom-key']) {
+          apiKey = String(req.headers['x-custom-key']);
+        }
+        endpoint = customEndpoint(req);
+        if (!endpoint) {
+          throw new RouteError('Custom endpoint not configured — set CUSTOM_API_BASE_URL or send an x-custom-base-url header');
+        }
       }
 
       return {
@@ -760,6 +782,8 @@ tunnelRouter.get('/models', async (req: Request, res: Response) => {
       llm7: (req.headers['x-llm7-key'] as string | undefined) || undefined,
       google: (req.headers['x-google-key'] as string | undefined) || undefined,
       puter: (req.headers['x-puter-key'] as string | undefined) || undefined,
+      custom: (req.headers['x-custom-key'] as string | undefined) || undefined,
+      customBaseUrl: (req.headers['x-custom-base-url'] as string | undefined) || undefined,
     };
     const hasFreshKey = Object.values(providedKeys).some((v) => !!v);
 
@@ -784,6 +808,10 @@ tunnelRouter.get('/models', async (req: Request, res: Response) => {
           providedKeys.puter || '',
           providedKeys.cloudflare || '',
           providedKeys.cloudflareAccount || '',
+          undefined,
+          providedKeys.customBaseUrl || providedKeys.custom
+            ? { baseUrl: providedKeys.customBaseUrl, apiKey: providedKeys.custom }
+            : undefined,
         );
         models = [...fresh.models];
         cache.updatedAt = fresh.updatedAt;
