@@ -49,6 +49,17 @@ export const VAULT_TO_ENV_MAP: Record<string, string> = {
   // a container restart.
   gmailClientId: 'GOOGLE_CLIENT_ID',
   gmailClientSecret: 'GOOGLE_CLIENT_SECRET',
+  // Generic OpenAI-compatible endpoint (issue #14): the operator's own base
+  // URL + optional key for a local runtime (Ollama, LM Studio, …) or any
+  // third-party gateway. The base URL is the gate — no URL, no source — and
+  // the key is optional because local runtimes usually have none.
+  // customModels is the optional allowlist / manual-add fallback, and
+  // customModerated is the operator's declaration of their own endpoint's
+  // moderation posture (here the `moderated` catalog tag is their call).
+  custom: 'CUSTOM_API_KEY',
+  customBaseUrl: 'CUSTOM_API_BASE_URL',
+  customModels: 'CUSTOM_MODELS',
+  customModerated: 'CUSTOM_MODERATED',
 };
 
 // Env vars in VAULT_TO_ENV_MAP that are NOT provider keys — they never gate
