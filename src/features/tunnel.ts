@@ -16,6 +16,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { readModelCache, syncModels, tryReadNvidiaKey } from '../models/model-sync.js';
 import { buildMemoryContext } from '../core/memory.js';
+import { isSelfHostedInstance } from '../core/vault-boot.js';
 import { buildSkillContext } from '../skills/skills.js';
 import { getModelHealth } from '../models/health.js';
 
@@ -93,11 +94,14 @@ function cloudflareChatEndpoint(): string {
   return `https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1/chat/completions`;
 }
 
-// The custom source (issue #14) has no built-in endpoint: the operator's base
-// URL comes from the x-custom-base-url header or CUSTOM_API_BASE_URL. Returns
-// '' when unconfigured — parseModelRoute turns that into a clear 400.
-function customEndpoint(req: Request): string {
-  const base = String(req.headers['x-custom-base-url'] || process.env.CUSTOM_API_BASE_URL || '')
+// The custom source (issue #14) has no built-in endpoint: the base URL is the
+// operator's CUSTOM_API_BASE_URL. The client-supplied x-custom-base-url
+// override is honored ONLY on self-hosted instances (see parseModelRoute) —
+// on a shared/hosted instance the server must not become a relay to
+// visitor-chosen URLs. Returns '' when unconfigured — parseModelRoute turns
+// that into a clear 400.
+function customEndpoint(): string {
+  const base = String(process.env.CUSTOM_API_BASE_URL || '')
     .trim()
     .replace(/\/+$/, '');
   return base ? `${base}/chat/completions` : '';
@@ -229,12 +233,24 @@ function parseModelRoute(modelString: string, req: Request): ParsedRoute {
             ? `https://api.cloudflare.com/client/v4/accounts/${accountOverride || process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions`
             : cloudflareChatEndpoint();
       } else if (provider === 'custom') {
-        if (req.headers['x-custom-key']) {
-          apiKey = String(req.headers['x-custom-key']);
-        }
-        endpoint = customEndpoint(req);
-        if (!endpoint) {
-          throw new RouteError('Custom endpoint not configured — set CUSTOM_API_BASE_URL or send an x-custom-base-url header');
+        // A client-supplied destination must NEVER inherit server credentials:
+        // if the base URL comes from the request, only the request's own key
+        // rides along (empty when absent). Header overrides are also limited
+        // to self-hosted instances — on a shared/hosted deployment the server
+        // must not relay to visitor-chosen URLs at all.
+        const headerBase = String(req.headers['x-custom-base-url'] || '').trim();
+        if (headerBase && isSelfHostedInstance()) {
+          endpoint = `${headerBase.replace(/\/+$/, '')}/chat/completions`;
+          apiKey = String(req.headers['x-custom-key'] || '');
+        } else {
+          endpoint = customEndpoint();
+          if (!endpoint) {
+            throw new RouteError(
+              headerBase && !isSelfHostedInstance()
+                ? 'Custom endpoints are operator-configured on this instance'
+                : 'Custom endpoint not configured — set CUSTOM_API_BASE_URL',
+            );
+          }
         }
       }
 
@@ -782,8 +798,6 @@ tunnelRouter.get('/models', async (req: Request, res: Response) => {
       llm7: (req.headers['x-llm7-key'] as string | undefined) || undefined,
       google: (req.headers['x-google-key'] as string | undefined) || undefined,
       puter: (req.headers['x-puter-key'] as string | undefined) || undefined,
-      custom: (req.headers['x-custom-key'] as string | undefined) || undefined,
-      customBaseUrl: (req.headers['x-custom-base-url'] as string | undefined) || undefined,
     };
     const hasFreshKey = Object.values(providedKeys).some((v) => !!v);
 
@@ -809,9 +823,6 @@ tunnelRouter.get('/models', async (req: Request, res: Response) => {
           providedKeys.cloudflare || '',
           providedKeys.cloudflareAccount || '',
           undefined,
-          providedKeys.customBaseUrl || providedKeys.custom
-            ? { baseUrl: providedKeys.customBaseUrl, apiKey: providedKeys.custom }
-            : undefined,
         );
         models = [...fresh.models];
         cache.updatedAt = fresh.updatedAt;
