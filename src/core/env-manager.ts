@@ -66,10 +66,17 @@ export const VAULT_TO_ENV_MAP: Record<string, string> = {
 // the first-key claim. The Gmail OAuth client pair is configuration an
 // operator may pre-seed (compose env) or set later via the onboarding UI;
 // an instance holding ONLY these must stay claimable by the first real
-// provider key (see serverHoldsNoProviderKeys).
+// provider key (see serverHoldsNoProviderKeys). The custom-endpoint trio is
+// the same class: CUSTOM_API_BASE_URL / CUSTOM_MODELS / CUSTOM_MODERATED are
+// non-secret configuration — only CUSTOM_API_KEY is a credential, so an
+// operator who configured just their own endpoint (e.g. a keyless local
+// Ollama) keeps the claim window open.
 export const NON_PROVIDER_ENV_VARS: ReadonlySet<string> = new Set([
   'GOOGLE_CLIENT_ID',
   'GOOGLE_CLIENT_SECRET',
+  'CUSTOM_API_BASE_URL',
+  'CUSTOM_MODELS',
+  'CUSTOM_MODERATED',
 ]);
 
 // Map .env variable names to vault field IDs
